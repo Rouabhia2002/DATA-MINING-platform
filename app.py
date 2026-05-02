@@ -16,8 +16,9 @@ import streamlit as st
 
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.model_selection import train_test_split
+from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier
@@ -467,29 +468,163 @@ elif page == "Preprocessing":
 
     # ── 3. CLEAN ─────────────────────────────────────────────
     with t3:
-        styled_header("🧹", "Data Cleaning", "Handle missing values before modelling")
+        styled_header("🧹", "Data Cleaning", "Remove duplicates and handle missing values")
 
         df = st.session_state.raw_df
         if df is None:
             st.warning("⚠️ Please upload a dataset first (Import tab).")
         else:
-            missing_total = df.isnull().sum().sum()
-            if missing_total == 0:
-                st.success("🎉 Your dataset has no missing values — nothing to clean!")
-                st.session_state.clean_df = df.copy()
+            # ── Dataset quality snapshot ──────────────────────
+            n_dup     = int(df.duplicated().sum())
+            n_missing = int(df.isnull().sum().sum())
+            n_miss_cols = int((df.isnull().sum() > 0).sum())
+
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("Total Rows",      f"{df.shape[0]:,}")
+            q2.metric("Duplicate Rows",  f"{n_dup:,}",
+                      delta=f"{n_dup/df.shape[0]*100:.1f}% of data" if n_dup else "None found",
+                      delta_color="inverse")
+            q3.metric("Missing Cells",   f"{n_missing:,}",
+                      delta=f"in {n_miss_cols} column(s)" if n_missing else "None found",
+                      delta_color="inverse")
+            q4.metric("Clean Rows (est.)",
+                      f"{df.shape[0] - n_dup:,}",
+                      help="Rows remaining after duplicate removal only")
+
+            divider()
+
+            # ════════════════════════════════════════════════
+            #  SECTION 1 — DUPLICATE REMOVAL
+            # ════════════════════════════════════════════════
+            st.markdown(
+                "<div style='font-family:Space Mono,monospace;font-size:1rem;"
+                "font-weight:700;color:#f0a500;margin-bottom:.6rem;'>"
+                "🔁 Step 1 — Duplicate Rows</div>",
+                unsafe_allow_html=True,
+            )
+
+            if n_dup == 0:
+                st.success("🎉 No duplicate rows found — nothing to remove!")
             else:
-                st.info(f"Found **{missing_total}** missing cell(s) across **{(df.isnull().sum()>0).sum()}** column(s).")
+                st.warning(
+                    f"Found **{n_dup} duplicate row(s)** "
+                    f"({n_dup / df.shape[0] * 100:.2f}% of the dataset)."
+                )
+
+                # Preview duplicates
+                with st.expander(f"🔍 Preview duplicate rows ({min(n_dup, 50)} shown)", expanded=False):
+                    dup_preview = df[df.duplicated(keep=False)].sort_values(
+                        by=df.columns.tolist()
+                    )
+                    st.dataframe(dup_preview.head(50), use_container_width=True)
+                    st.caption(
+                        f"Showing rows that appear more than once. "
+                        f"{'All ' if n_dup <= 50 else 'First 50 of '}{n_dup} duplicate(s) displayed."
+                    )
+
+                # Which occurrence to keep
+                keep_opt = st.radio(
+                    "Which occurrence to keep?",
+                    ["First occurrence  (keep='first')",
+                     "Last occurrence   (keep='last')",
+                     "Drop ALL duplicates (keep=False)"],
+                    horizontal=True,
+                    key="dup_keep",
+                )
+                keep_map = {
+                    "First occurrence  (keep='first')":       "first",
+                    "Last occurrence   (keep='last')":        "last",
+                    "Drop ALL duplicates (keep=False)":       False,
+                }
+                keep_val = keep_map[keep_opt]
+
+                # Subset option
+                with st.expander("⚙️ Advanced — check duplicates on specific columns only", expanded=False):
+                    dup_subset = st.multiselect(
+                        "Columns to consider (leave empty = all columns)",
+                        df.columns.tolist(),
+                        key="dup_subset",
+                    )
+                    if dup_subset:
+                        n_dup_sub = int(df.duplicated(subset=dup_subset).sum())
+                        st.info(
+                            f"With these columns, **{n_dup_sub}** duplicate row(s) would be removed."
+                        )
+
+                if st.button("🗑️ Remove Duplicates", key="btn_dedup"):
+                    with st.spinner("Removing duplicates …"):
+                        subset_arg = dup_subset if dup_subset else None
+                        deduped = st.session_state.clean_df.drop_duplicates(
+                            subset=subset_arg, keep=keep_val
+                        )
+                        removed = st.session_state.clean_df.shape[0] - deduped.shape[0]
+                        st.session_state.clean_df    = deduped
+                        st.session_state.processed_df = None   # invalidate normalisation
+
+                    st.success(
+                        f"✅ Removed **{removed}** duplicate row(s). "
+                        f"Dataset now has **{deduped.shape[0]:,} rows**."
+                    )
+                    st.dataframe(deduped.head(8), use_container_width=True)
+
+            divider()
+
+            # ════════════════════════════════════════════════
+            #  SECTION 2 — MISSING VALUES
+            # ════════════════════════════════════════════════
+            st.markdown(
+                "<div style='font-family:Space Mono,monospace;font-size:1rem;"
+                "font-weight:700;color:#0078d4;margin-bottom:.6rem;'>"
+                "❓ Step 2 — Missing Values</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Recompute on the already-deduped clean_df (may differ from raw)
+            working_df    = st.session_state.clean_df
+            missing_total = int(working_df.isnull().sum().sum())
+
+            if missing_total == 0:
+                st.success("🎉 No missing values found — nothing to fill or drop!")
+            else:
+                mv      = working_df.isnull().sum()
+                mv_pct  = (mv / len(working_df) * 100).round(2)
+                mv_df   = pd.DataFrame({"Missing": mv, "Pct (%)": mv_pct})
+                mv_df   = mv_df[mv_df["Missing"] > 0].sort_values("Missing", ascending=False)
+
+                st.info(
+                    f"Found **{missing_total}** missing cell(s) across "
+                    f"**{len(mv_df)}** column(s)."
+                )
+
+                with st.expander("📋 Missing values per column", expanded=True):
+                    # Mini bar chart alongside the table
+                    bc1, bc2 = st.columns([1, 1])
+                    with bc1:
+                        st.dataframe(mv_df, use_container_width=True)
+                    with bc2:
+                        fig_mv, ax_mv = plt.subplots(
+                            figsize=(5, max(2.5, len(mv_df) * 0.38))
+                        )
+                        mv_df["Pct (%)"].sort_values().plot.barh(
+                            ax=ax_mv, color="#0078d4", edgecolor="none", alpha=0.85
+                        )
+                        ax_mv.set_xlabel("Missing (%)")
+                        ax_mv.set_title("Missing-value Rate by Column", fontsize=10)
+                        plt.tight_layout()
+                        fig_to_streamlit(fig_mv)
+
                 strategy = st.selectbox(
                     "Missing-value strategy",
                     ["Drop rows with any missing value",
-                     "Fill with Mean  (numeric cols)",
+                     "Fill with Mean   (numeric cols)",
                      "Fill with Median (numeric cols)",
-                     "Fill with Mode  (all cols)"],
+                     "Fill with Mode   (all cols)"],
+                    key="mv_strategy",
                 )
 
-                if st.button("🧹 Apply Cleaning"):
-                    with st.spinner("Cleaning …"):
-                        cleaned = df.copy()
+                if st.button("🩹 Apply Missing-Value Treatment", key="btn_mv"):
+                    with st.spinner("Treating missing values …"):
+                        cleaned = working_df.copy()
                         if "Drop" in strategy:
                             cleaned = cleaned.dropna()
                         elif "Mean" in strategy:
@@ -498,28 +633,59 @@ elif page == "Preprocessing":
                         elif "Median" in strategy:
                             num = cleaned.select_dtypes(include=np.number).columns
                             cleaned[num] = cleaned[num].fillna(cleaned[num].median())
-                        else:  # Mode
+                        else:   # Mode
                             for col in cleaned.columns:
-                                cleaned[col] = cleaned[col].fillna(cleaned[col].mode()[0])
+                                cleaned[col] = cleaned[col].fillna(
+                                    cleaned[col].mode()[0]
+                                )
+                        st.session_state.clean_df     = cleaned
+                        st.session_state.processed_df = None   # invalidate normalisation
 
-                        st.session_state.clean_df = cleaned
-                        st.session_state.processed_df = None  # reset normalisation
-
-                    n_removed = df.shape[0] - cleaned.shape[0]
+                    n_removed = working_df.shape[0] - cleaned.shape[0]
                     st.success(
-                        f"✅ Cleaning done — remaining: **{cleaned.shape[0]} rows × {cleaned.shape[1]} cols**"
-                        + (f" ({n_removed} rows removed)" if n_removed > 0 else "")
+                        f"✅ Done — remaining: **{cleaned.shape[0]:,} rows × "
+                        f"{cleaned.shape[1]} cols**"
+                        + (f"  ({n_removed} rows dropped)" if n_removed > 0 else "")
                     )
                     st.dataframe(cleaned.head(8), use_container_width=True)
 
-                # Download cleaned data
-                if st.session_state.clean_df is not None:
-                    st.download_button(
-                        "⬇️ Download Cleaned Dataset",
-                        data=df_to_csv_bytes(st.session_state.clean_df),
-                        file_name="cleaned_dataset.csv",
-                        mime="text/csv",
-                    )
+            divider()
+
+            # ── Final summary + download ──────────────────
+            if st.session_state.clean_df is not None:
+                orig_rows   = df.shape[0]
+                final_rows  = st.session_state.clean_df.shape[0]
+                total_removed = orig_rows - final_rows
+
+                st.markdown(
+                    f"""
+                    <div class='card' style='display:flex;gap:2rem;align-items:center;'>
+                      <div>
+                        <div style='color:#7d8fa3;font-size:.8rem;'>ORIGINAL</div>
+                        <div style='font-family:Space Mono,monospace;font-size:1.3rem;
+                                    color:#e6edf3;'>{orig_rows:,} rows</div>
+                      </div>
+                      <div style='font-size:1.4rem;color:#7d8fa3;'>→</div>
+                      <div>
+                        <div style='color:#7d8fa3;font-size:.8rem;'>AFTER CLEANING</div>
+                        <div style='font-family:Space Mono,monospace;font-size:1.3rem;
+                                    color:#00c9a7;'>{final_rows:,} rows</div>
+                      </div>
+                      <div style='margin-left:auto;'>
+                        <div style='color:#7d8fa3;font-size:.8rem;'>REMOVED</div>
+                        <div style='font-family:Space Mono,monospace;font-size:1.3rem;
+                                    color:#e05c5c;'>{total_removed:,} rows</div>
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.download_button(
+                    "⬇️ Download Cleaned Dataset",
+                    data=df_to_csv_bytes(st.session_state.clean_df),
+                    file_name="cleaned_dataset.csv",
+                    mime="text/csv",
+                )
 
     # ── 4. NORMALISE ─────────────────────────────────────────
     with t4:
@@ -697,12 +863,71 @@ elif page == "Preprocessing":
 # ════════════════════════════════════════════════════════════
 elif page == "Clustering":
 
+    # ── Shared colour palette for all clustering visualisations
+    PALETTE = [
+        "#00c9a7","#0078d4","#f0a500","#e05c5c",
+        "#a259ff","#ff6b6b","#4ecdc4","#45b7d1",
+        "#96ceb4","#feca57","#ff9ff3","#54a0ff",
+    ]
+    RANDOM_STATE = 42
+
+    # ────────────────────────────────────────────────────────
+    #  ALGORITHM REFERENCE CARDS (shown at top)
+    # ────────────────────────────────────────────────────────
+    ALGO_INFO = {
+        "K-Means": {
+            "icon": "⭕",
+            "family": "Partitional",
+            "complexity": "O(n·k·t)",
+            "params": "k (clusters)",
+            "noise": "No",
+            "desc": "Partitions data into k clusters by minimising within-cluster variance. "
+                    "Fast and scalable; sensitive to outliers and initial centroid placement.",
+        },
+        "K-Medoids": {
+            "icon": "🔷",
+            "family": "Partitional",
+            "complexity": "O(k·(n−k)²)",
+            "params": "k (clusters)",
+            "noise": "No",
+            "desc": "Like K-Means but uses actual data points (medoids) as cluster centres. "
+                    "More robust to outliers; slower on large datasets.",
+        },
+        "AGNES": {
+            "icon": "🌿",
+            "family": "Hierarchical (Agglomerative)",
+            "complexity": "O(n² log n)",
+            "params": "k (cut level) · linkage",
+            "noise": "No",
+            "desc": "Bottom-up: starts with each point as its own cluster, then merges the "
+                    "closest pair iteratively until k clusters remain. Produces a dendrogram.",
+        },
+        "DIANA": {
+            "icon": "🌳",
+            "family": "Hierarchical (Divisive)",
+            "complexity": "O(2ⁿ) exact / O(n² log n) approx",
+            "params": "k (cut level) · linkage",
+            "noise": "No",
+            "desc": "Top-down: starts with one cluster containing all points and recursively "
+                    "splits until k clusters remain. Approximated here via complete-linkage scipy hierarchy.",
+        },
+        "DBSCAN": {
+            "icon": "🌐",
+            "family": "Density-based",
+            "complexity": "O(n log n)",
+            "params": "ε (eps) · MinPts",
+            "noise": "Yes (label = −1)",
+            "desc": "Groups points that are closely packed, marking sparse regions as noise. "
+                    "Discovers arbitrary-shaped clusters; no k required.",
+        },
+    }
+
     st.markdown(
         "<h2 style='font-family:Space Mono,monospace;color:#00c9a7;'>🔵 Clustering</h2>",
         unsafe_allow_html=True,
     )
 
-    # Active dataframe
+    # ── Active dataframe
     df_c = (
         st.session_state.processed_df
         if st.session_state.processed_df is not None
@@ -720,154 +945,390 @@ elif page == "Clustering":
         st.error("Need at least 2 numeric columns for clustering.")
         st.stop()
 
-    # ── Feature selection
-    with st.expander("🔧 Feature Selection", expanded=True):
-        sel_cols = st.multiselect(
-            "Select features for clustering",
-            num_cols, default=num_cols,
-        )
+    # ── Two sub-tabs: Run & Compare
+    clust_tab1, clust_tab2 = st.tabs(["🚀 Run Algorithm", "📚 Algorithm Reference"])
 
-    if not sel_cols:
-        st.info("Select at least 2 features above.")
-        st.stop()
+    # ════════════════════════════════
+    #  TAB 1 — RUN
+    # ════════════════════════════════
+    with clust_tab1:
 
-    X = df_c[sel_cols].dropna().values
-
-    # ── Parameters
-    c_left, c_right = st.columns([1, 2])
-    with c_left:
-        st.markdown("#### ⚙️ Parameters")
-        algo = st.selectbox("Algorithm", ["K-Means", "K-Medoids"])
-        k = st.slider("Number of clusters (k)", 2, 12, 3)
-        random_state = 42
-
-    # ── Elbow Method
-    with c_right:
-        st.markdown("#### 📈 Elbow Method")
-        with st.spinner("Computing inertia for k = 2 … 10 …"):
-            inertias = []
-            ks_range = range(2, 11)
-            for ki in ks_range:
-                km = KMeans(n_clusters=ki, random_state=random_state, n_init=10)
-                km.fit(X)
-                inertias.append(km.inertia_)
-
-        fig, ax = plt.subplots(figsize=(6, 3.5))
-        ax.plot(list(ks_range), inertias, "o-", color="#00c9a7", linewidth=2, markersize=6)
-        ax.axvline(k, color="#f0a500", linestyle="--", linewidth=1.5, label=f"Selected k={k}")
-        ax.set_xlabel("Number of clusters k")
-        ax.set_ylabel("Inertia (WCSS)")
-        ax.set_title("Elbow Method")
-        ax.legend(fontsize=9)
-        plt.tight_layout()
-        fig_to_streamlit(fig)
-
-    divider()
-
-    # ── Run clustering
-    if st.button("🚀 Run Clustering", type="primary"):
-        with st.spinner(f"Running {algo} with k={k} …"):
-
-            if algo == "K-Means":
-                model = KMeans(n_clusters=k, random_state=random_state, n_init=10)
-                labels = model.fit_predict(X)
-            else:
-                # K-Medoids via sklearn_extra; graceful fallback
-                try:
-                    from sklearn_extra.cluster import KMedoids
-                    model = KMedoids(n_clusters=k, random_state=random_state)
-                    labels = model.fit_predict(X)
-                except ImportError:
-                    st.warning(
-                        "⚠️ `sklearn-extra` not installed. Falling back to K-Means. "
-                        "Install via: `pip install scikit-learn-extra`"
-                    )
-                    model = KMeans(n_clusters=k, random_state=random_state, n_init=10)
-                    labels = model.fit_predict(X)
-
-            sil = silhouette_score(X, labels)
-
-            # PCA for 2-D plot
-            pca = PCA(n_components=2, random_state=random_state)
-            X2d = pca.fit_transform(X)
-
-        # ── Metrics
-        st.markdown("#### 📊 Evaluation")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Algorithm", algo)
-        col2.metric("Clusters (k)", k)
-        col3.metric(
-            "Silhouette Score",
-            f"{sil:.4f}",
-            help="Ranges −1 to +1. Closer to +1 = well-separated clusters.",
-        )
-
-        divider()
-
-        # ── Cluster plot
-        st.markdown("#### 📉 Cluster Visualisation (PCA 2D)")
-        PALETTE = [
-            "#00c9a7","#0078d4","#f0a500","#e05c5c",
-            "#a259ff","#ff6b6b","#4ecdc4","#45b7d1",
-            "#96ceb4","#feca57","#ff9ff3","#54a0ff",
-        ]
-        colors = [PALETTE[l % len(PALETTE)] for l in labels]
-
-        fig, ax = plt.subplots(figsize=(8, 5))
-        scatter = ax.scatter(
-            X2d[:, 0], X2d[:, 1],
-            c=labels, cmap="tab10", alpha=0.75, s=30, edgecolors="none",
-        )
-        # Cluster centres in PCA space
-        if hasattr(model, "cluster_centers_"):
-            centers_2d = pca.transform(model.cluster_centers_)
-            ax.scatter(
-                centers_2d[:, 0], centers_2d[:, 1],
-                s=200, c="white", marker="*",
-                edgecolors="#f0a500", linewidths=1.5,
-                zorder=5, label="Centroid",
+        # ── Feature selection
+        with st.expander("🔧 Feature Selection", expanded=True):
+            sel_cols = st.multiselect(
+                "Select features for clustering",
+                num_cols, default=num_cols,
             )
-        ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}% var)")
-        ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}% var)")
-        ax.set_title(f"{algo} — k={k}  |  Silhouette={sil:.4f}")
-        patches = [
-            mpatches.Patch(color=PALETTE[i % len(PALETTE)], label=f"Cluster {i}")
-            for i in range(k)
-        ]
-        ax.legend(handles=patches, loc="upper right", fontsize=8, framealpha=.3)
-        plt.tight_layout()
-        fig_to_streamlit(fig)
 
-        # ── Cluster size distribution
-        divider()
-        with st.expander("📋 Cluster Composition", expanded=False):
-            df_clustered = df_c[sel_cols].dropna().copy()
-            df_clustered["Cluster"] = labels
-            cluster_counts = df_clustered["Cluster"].value_counts().sort_index()
+        if not sel_cols:
+            st.info("Select at least 2 features above.")
+            st.stop()
 
-            fig2, ax2 = plt.subplots(figsize=(6, 3))
-            bars = ax2.bar(
-                [f"C{i}" for i in cluster_counts.index],
-                cluster_counts.values,
-                color=[PALETTE[i % len(PALETTE)] for i in cluster_counts.index],
-                edgecolor="none", width=0.55,
+        X = df_c[sel_cols].dropna().values
+
+        # ── Algorithm + parameters
+        c_left, c_right = st.columns([1, 2])
+
+        with c_left:
+            st.markdown("#### ⚙️ Algorithm & Parameters")
+            algo = st.selectbox(
+                "Algorithm",
+                ["K-Means", "K-Medoids", "AGNES", "DIANA", "DBSCAN"],
             )
-            for bar in bars:
-                ax2.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 1,
-                    str(bar.get_height()), ha="center", va="bottom",
-                    fontsize=9, color="#e6edf3",
+
+            # ── Show algorithm badge
+            info = ALGO_INFO[algo]
+            st.markdown(
+                f"<span class='badge'>{info['family']}</span>"
+                f"<span class='badge' style='background:rgba(0,120,212,.15);"
+                f"color:#0078d4;border-color:rgba(0,120,212,.3);'>"
+                f"Noise={info['noise']}</span>",
+                unsafe_allow_html=True,
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # ── Parameter widgets per algorithm
+            if algo in ("K-Means", "K-Medoids"):
+                k = st.slider("Number of clusters (k)", 2, 12, 3)
+
+            elif algo == "AGNES":
+                k = st.slider("Number of clusters (k)", 2, 12, 3)
+                agnes_linkage = st.selectbox(
+                    "Linkage criterion",
+                    ["ward", "complete", "average", "single"],
+                    help="ward: minimises variance · complete: max-distance · "
+                         "average: mean-distance · single: min-distance",
                 )
-            ax2.set_ylabel("Count")
-            ax2.set_title("Points per Cluster")
-            plt.tight_layout()
-            fig_to_streamlit(fig2)
 
-            st.dataframe(
-                df_clustered.groupby("Cluster")[sel_cols].mean().round(4),
-                use_container_width=True,
+            elif algo == "DIANA":
+                k = st.slider("Number of clusters (k)", 2, 12, 3)
+                diana_linkage = st.selectbox(
+                    "Linkage (for divisive split)",
+                    ["complete", "average", "single"],
+                    help="Complete linkage gives the most compact splits (closest to true DIANA).",
+                )
+
+            else:  # DBSCAN
+                eps = st.slider(
+                    "ε — epsilon (neighbourhood radius)", 0.05, 5.0, 0.5, step=0.05,
+                    help="Maximum distance between two samples to be considered neighbours.",
+                )
+                min_samples = st.slider(
+                    "MinPts (min_samples)", 2, 20, 5,
+                    help="Minimum points in a neighbourhood to form a core point.",
+                )
+                st.info("ℹ️ DBSCAN does **not** require k. Noise points are labelled **−1**.")
+
+        # ── Elbow Method (only for k-based algorithms)
+        with c_right:
+            if algo in ("K-Means", "K-Medoids", "AGNES", "DIANA"):
+                st.markdown("#### 📈 Elbow / Inertia Guide")
+                with st.spinner("Computing K-Means inertia for k = 2…10 …"):
+                    inertias, sil_scores = [], []
+                    ks_range = range(2, 11)
+                    for ki in ks_range:
+                        km_tmp = KMeans(n_clusters=ki, random_state=RANDOM_STATE, n_init=10)
+                        lbl_tmp = km_tmp.fit_predict(X)
+                        inertias.append(km_tmp.inertia_)
+                        sil_scores.append(silhouette_score(X, lbl_tmp))
+
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 3.5))
+                # Elbow
+                ax1.plot(list(ks_range), inertias, "o-", color="#00c9a7",
+                         linewidth=2, markersize=6)
+                ax1.axvline(k, color="#f0a500", linestyle="--",
+                            linewidth=1.5, label=f"k={k}")
+                ax1.set_xlabel("k"); ax1.set_ylabel("Inertia (WCSS)")
+                ax1.set_title("Elbow Method"); ax1.legend(fontsize=8)
+                # Silhouette guide
+                ax2.plot(list(ks_range), sil_scores, "s-", color="#a259ff",
+                         linewidth=2, markersize=6)
+                ax2.axvline(k, color="#f0a500", linestyle="--",
+                            linewidth=1.5, label=f"k={k}")
+                ax2.set_xlabel("k"); ax2.set_ylabel("Silhouette Score")
+                ax2.set_title("Silhouette vs k"); ax2.legend(fontsize=8)
+                plt.tight_layout()
+                fig_to_streamlit(fig)
+
+            else:  # DBSCAN: show k-distance plot to help choose eps
+                st.markdown("#### 📈 k-Distance Plot (ε Selector)")
+                st.caption("Sort distances to the k-th nearest neighbour. "
+                           "The 'elbow' suggests a good ε value.")
+                from sklearn.neighbors import NearestNeighbors
+                with st.spinner("Computing nearest-neighbour distances …"):
+                    nbrs = NearestNeighbors(n_neighbors=min_samples).fit(X)
+                    distances, _ = nbrs.kneighbors(X)
+                    k_dist = np.sort(distances[:, -1])[::-1]
+
+                fig, ax = plt.subplots(figsize=(8, 3.8))
+                ax.plot(k_dist, color="#00c9a7", linewidth=1.5)
+                ax.axhline(eps, color="#f0a500", linestyle="--",
+                           linewidth=1.5, label=f"ε = {eps}")
+                ax.set_xlabel("Points (sorted)"); ax.set_ylabel("k-th NN distance")
+                ax.set_title(f"k-Distance Graph  (k={min_samples})")
+                ax.legend(fontsize=9)
+                plt.tight_layout()
+                fig_to_streamlit(fig)
+
+        divider()
+
+        # ────────────────────────────────────────────────────
+        #  DENDROGRAM (only for hierarchical algorithms)
+        # ────────────────────────────────────────────────────
+        if algo in ("AGNES", "DIANA"):
+            lnk = agnes_linkage if algo == "AGNES" else diana_linkage
+            with st.expander(
+                f"🌲 Dendrogram — {algo} (linkage='{lnk}')", expanded=False
+            ):
+                with st.spinner("Building dendrogram …"):
+                    # AGNES = bottom-up, DIANA approximated top-down via scipy complete
+                    Z = linkage(X[:min(300, len(X))], method=lnk)
+
+                fig_d, ax_d = plt.subplots(figsize=(12, 4))
+                dendrogram(
+                    Z, ax=ax_d,
+                    color_threshold=0.7 * max(Z[:, 2]),
+                    above_threshold_color="#7d8fa3",
+                    leaf_font_size=7,
+                    truncate_mode="lastp", p=30,
+                )
+                ax_d.set_title(
+                    f"{'Agglomerative (AGNES)' if algo=='AGNES' else 'Divisive approx (DIANA)'}"
+                    f" Dendrogram — linkage='{lnk}'"
+                )
+                ax_d.set_ylabel("Distance")
+                plt.tight_layout()
+                fig_to_streamlit(fig_d)
+                if algo == "DIANA":
+                    st.caption(
+                        "ℹ️ True DIANA is top-down divisive. This view uses scipy's "
+                        "complete-linkage agglomerative hierarchy as a structural approximation. "
+                        "The cluster assignment below is performed top-down by cutting this tree."
+                    )
+
+        # ────────────────────────────────────────────────────
+        #  RUN BUTTON
+        # ────────────────────────────────────────────────────
+        if st.button("🚀 Run Clustering", type="primary"):
+            with st.spinner(f"Running {algo} …"):
+
+                # ── K-Means
+                if algo == "K-Means":
+                    model = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+                    labels = model.fit_predict(X)
+                    has_centers = True
+
+                # ── K-Medoids
+                elif algo == "K-Medoids":
+                    try:
+                        from sklearn_extra.cluster import KMedoids
+                        model = KMedoids(n_clusters=k, random_state=RANDOM_STATE)
+                        labels = model.fit_predict(X)
+                        has_centers = True
+                    except ImportError:
+                        st.warning(
+                            "⚠️ `scikit-learn-extra` not installed → falling back to K-Means. "
+                            "Install: `pip install scikit-learn-extra`"
+                        )
+                        model = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+                        labels = model.fit_predict(X)
+                        has_centers = True
+
+                # ── AGNES (Agglomerative, bottom-up)
+                elif algo == "AGNES":
+                    model = AgglomerativeClustering(
+                        n_clusters=k, linkage=agnes_linkage
+                    )
+                    labels = model.fit_predict(X)
+                    has_centers = False
+
+                # ── DIANA (Divisive, top-down — scipy approximation)
+                elif algo == "DIANA":
+                    # Build complete-linkage hierarchy then cut top-down at k clusters
+                    Z = linkage(X, method=diana_linkage)
+                    # fcluster cuts the tree to produce exactly k flat clusters
+                    labels = fcluster(Z, t=k, criterion="maxclust") - 1  # 0-indexed
+                    has_centers = False
+                    model = None
+
+                # ── DBSCAN
+                else:
+                    model = DBSCAN(eps=eps, min_samples=min_samples)
+                    labels = model.fit_predict(X)
+                    has_centers = False
+                    n_noise = int((labels == -1).sum())
+                    k_found = len(set(labels)) - (1 if -1 in labels else 0)
+
+                # ── Silhouette (skip if only 1 cluster or all noise)
+                unique_labels = set(labels)
+                valid_labels = [l for l in unique_labels if l != -1]
+                if len(valid_labels) >= 2:
+                    mask = labels != -1
+                    sil = silhouette_score(X[mask], labels[mask]) if mask.sum() > 1 else float("nan")
+                else:
+                    sil = float("nan")
+
+                # ── PCA 2D
+                pca = PCA(n_components=2, random_state=RANDOM_STATE)
+                X2d = pca.fit_transform(X)
+
+            # ────────────────────────────────────────────────
+            #  METRICS ROW
+            # ────────────────────────────────────────────────
+            st.markdown("#### 📊 Evaluation")
+            if algo == "DBSCAN":
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Algorithm", algo)
+                m2.metric("Clusters found", k_found)
+                m3.metric("Noise points", n_noise,
+                          help="Points labelled −1 (do not belong to any cluster)")
+                m4.metric(
+                    "Silhouette Score",
+                    f"{sil:.4f}" if not np.isnan(sil) else "N/A",
+                    help="Computed on non-noise points only.",
+                )
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Algorithm", algo)
+                m2.metric("Clusters (k)", k)
+                m3.metric(
+                    "Silhouette Score",
+                    f"{sil:.4f}" if not np.isnan(sil) else "N/A",
+                    help="Ranges −1 to +1. Closer to +1 = well-separated clusters.",
+                )
+
+            divider()
+
+            # ────────────────────────────────────────────────
+            #  PCA SCATTER PLOT
+            # ────────────────────────────────────────────────
+            st.markdown("#### 📉 Cluster Visualisation (PCA 2D)")
+
+            # Build colour map — noise (−1) → grey
+            unique_sorted = sorted(valid_labels)
+            color_map = {lbl: PALETTE[i % len(PALETTE)] for i, lbl in enumerate(unique_sorted)}
+            color_map[-1] = "#444c56"   # noise colour
+            point_colors = [color_map[l] for l in labels]
+
+            fig, ax = plt.subplots(figsize=(9, 5))
+
+            # Plot non-noise points
+            for lbl in unique_sorted:
+                mask = labels == lbl
+                ax.scatter(
+                    X2d[mask, 0], X2d[mask, 1],
+                    c=color_map[lbl], alpha=0.78, s=28,
+                    edgecolors="none", label=f"Cluster {lbl}",
+                )
+            # Plot noise
+            if -1 in labels:
+                noise_mask = labels == -1
+                ax.scatter(
+                    X2d[noise_mask, 0], X2d[noise_mask, 1],
+                    c="#444c56", alpha=0.5, s=18,
+                    marker="x", label="Noise (−1)",
+                )
+
+            # Centroids (K-Means / K-Medoids)
+            if has_centers and hasattr(model, "cluster_centers_"):
+                centers_2d = pca.transform(model.cluster_centers_)
+                ax.scatter(
+                    centers_2d[:, 0], centers_2d[:, 1],
+                    s=220, c="white", marker="*",
+                    edgecolors="#f0a500", linewidths=1.5,
+                    zorder=6, label="Centroid",
+                )
+
+            ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}% var)")
+            ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}% var)")
+            sil_str = f"{sil:.4f}" if not np.isnan(sil) else "N/A"
+            ax.set_title(
+                f"{algo}"
+                + (f" — k={k}" if algo not in ("DBSCAN",) else f" — ε={eps}, MinPts={min_samples}")
+                + f"  |  Silhouette={sil_str}"
             )
+            ax.legend(loc="upper right", fontsize=8, framealpha=0.3,
+                      ncol=max(1, len(unique_sorted)//8))
+            plt.tight_layout()
+            fig_to_streamlit(fig)
+
+            # ────────────────────────────────────────────────
+            #  CLUSTER COMPOSITION
+            # ────────────────────────────────────────────────
+            divider()
+            with st.expander("📋 Cluster Composition & Per-Cluster Means", expanded=False):
+                df_clustered = df_c[sel_cols].dropna().copy()
+                df_clustered["Cluster"] = labels
+                cluster_counts = (
+                    df_clustered["Cluster"].value_counts().sort_index()
+                )
+
+                fig2, ax2 = plt.subplots(figsize=(max(5, len(cluster_counts)*0.7), 3.2))
+                bar_colors = [
+                    color_map.get(i, "#7d8fa3") for i in cluster_counts.index
+                ]
+                bars = ax2.bar(
+                    [f"C{i}" if i != -1 else "Noise" for i in cluster_counts.index],
+                    cluster_counts.values,
+                    color=bar_colors, edgecolor="none", width=0.55,
+                )
+                for bar in bars:
+                    ax2.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.5,
+                        str(int(bar.get_height())),
+                        ha="center", va="bottom", fontsize=9, color="#e6edf3",
+                    )
+                ax2.set_ylabel("Count")
+                ax2.set_title("Points per Cluster")
+                plt.tight_layout()
+                fig_to_streamlit(fig2)
+
+                # Per-cluster mean table (exclude noise for readability)
+                non_noise_df = df_clustered[df_clustered["Cluster"] != -1]
+                if not non_noise_df.empty:
+                    st.dataframe(
+                        non_noise_df.groupby("Cluster")[sel_cols].mean().round(4),
+                        use_container_width=True,
+                    )
+
+    # ════════════════════════════════
+    #  TAB 2 — REFERENCE
+    # ════════════════════════════════
+    with clust_tab2:
+        styled_header("📚", "Algorithm Reference",
+                      "Theory, complexity, and use-cases for each clustering method")
+        divider()
+
+        for name, info in ALGO_INFO.items():
+            with st.expander(f"{info['icon']}  {name} — {info['family']}", expanded=False):
+                d1, d2 = st.columns([3, 2])
+                with d1:
+                    st.markdown(f"**Description:** {info['desc']}")
+                with d2:
+                    st.markdown(
+                        f"""
+                        <div class='card' style='font-size:.88rem;'>
+                          <b>Complexity:</b> <code>{info['complexity']}</code><br>
+                          <b>Parameters:</b> {info['params']}<br>
+                          <b>Handles noise:</b> {info['noise']}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+        divider()
+
+        # ── Comparison table
+        st.markdown("#### ⚖️ Quick Comparison")
+        comp_data = {
+            "Algorithm":  list(ALGO_INFO.keys()),
+            "Family":     [v["family"]      for v in ALGO_INFO.values()],
+            "Key Params": [v["params"]      for v in ALGO_INFO.values()],
+            "Complexity": [v["complexity"]  for v in ALGO_INFO.values()],
+            "Noise":      [v["noise"]       for v in ALGO_INFO.values()],
+        }
+        st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
 
 
 # ════════════════════════════════════════════════════════════
